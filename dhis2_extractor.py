@@ -2,7 +2,12 @@
 DHIS2 API client.
 
 Targets DHIS2 2.30 (unversioned /api/ endpoints).
-Handles retries, authentication, and metadata / data value fetching.
+Handles retries, authentication, empty response bodies,
+and metadata / data value fetching.
+
+Supports multi-instance via `url`/`username`/`password` arguments:
+    ex = DHIS2Extractor()                              # PIH (default)
+    ex = DHIS2Extractor(url=MOH_URL, username=..., ...)  # MOH
 """
 
 import logging
@@ -19,14 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class DHIS2Extractor:
-    """
-    Client for a DHIS2 instance.
-
-    Usage:
-        ex = DHIS2Extractor()                       # DHIS2 PIH (default)
-        ex = DHIS2Extractor(url="https://hmis.gov.ls/dhis",
-                            username="duzoap", password="Demo@1234")  # DHIS2 MOH
-    """
+    """Client for a DHIS2 instance (PIH or MOH)."""
 
     def __init__(self, url=None, username=None, password=None):
         """
@@ -36,7 +34,7 @@ class DHIS2Extractor:
             password: DHIS2 password. Defaults to config.DHIS2_PASSWORD.
         """
         self.base_url = (url or config.DHIS2_URL).rstrip("/")
-        # DHIS2 2.30 does not support versioned endpoints for metadata
+        # DHIS2 2.30 does not use versioned endpoints for metadata
         self.api_url = f"{self.base_url}/api"
 
         self._username = username or config.DHIS2_USERNAME
@@ -64,6 +62,26 @@ class DHIS2Extractor:
         return session
 
     # ------------------------------------------------------------------ #
+    # Helper: safe JSON parsing
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _safe_json(resp, context=""):
+        """
+        Parse JSON safely, handling empty response bodies.
+        
+        DHIS2 (especially MOH) sometimes returns HTTP 200 with empty body
+        when a dataset has no data. Treat that as {"dataValues": []}.
+        """
+        if not resp.text or resp.text.strip() == "":
+            logger.debug(f"Empty response body {context} — treating as empty result")
+            return {"dataValues": []}
+        try:
+            return resp.json()
+        except ValueError as e:
+            logger.warning(f"Invalid JSON {context}: {e}. Body starts with: {resp.text[:100]!r}")
+            return {"dataValues": []}
+
+    # ------------------------------------------------------------------ #
     # Data values (the fact extraction)
     # ------------------------------------------------------------------ #
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=30))
@@ -78,7 +96,7 @@ class DHIS2Extractor:
                           or relative like 'LAST_12_MONTHS').
 
         Returns:
-            Parsed JSON dict from /api/dataValueSets.
+            Parsed JSON dict. If empty response body, returns {"dataValues": []}.
         """
         endpoint = f"{self.api_url}/dataValueSets"
         params = {
@@ -96,18 +114,19 @@ class DHIS2Extractor:
         )
         resp = self.session.get(endpoint, params=params, timeout=120)
         resp.raise_for_status()
-        data = resp.json()
-        logger.info(f"Received {len(data.get('dataValues', []))} data values")
+
+        data = self._safe_json(
+            resp, context=f"dataset={data_set_id}, period={period}"
+        )
+        count = len(data.get("dataValues", []))
+        logger.info(f"Received {count} data values")
         return data
 
     # ------------------------------------------------------------------ #
     # Metadata — simplified versions (used by the ETL pipeline)
     # ------------------------------------------------------------------ #
     def get_datasets(self):
-        """
-        Fetch all datasets with minimal fields (used by full_extractor).
-        Returns list of dicts.
-        """
+        """Fetch all datasets with minimal fields."""
         url = f"{self.api_url}/dataSets"
         params = {
             "paging": "false",
@@ -116,10 +135,10 @@ class DHIS2Extractor:
         logger.info(f"Fetching datasets from {url}")
         resp = self.session.get(url, params=params, timeout=120)
         resp.raise_for_status()
-        return resp.json().get("dataSets", [])
+        return self._safe_json(resp, "datasets").get("dataSets", [])
 
-    # Alias kept for backwards compatibility with earlier code
     def get_all_datasets(self):
+        """Alias for get_datasets (backward compat)."""
         return self.get_datasets()
 
     def get_data_elements(self):
@@ -135,13 +154,14 @@ class DHIS2Extractor:
         logger.info(f"Fetching data elements from {url}")
         resp = self.session.get(url, params=params, timeout=120)
         resp.raise_for_status()
+        data = self._safe_json(resp, "dataElements")
         return {
             de["id"]: {
                 "name": de.get("displayName") or de.get("name"),
                 "code": de.get("code"),
                 "value_type": de.get("valueType"),
             }
-            for de in resp.json().get("dataElements", [])
+            for de in data.get("dataElements", [])
         }
 
     def get_org_units(self):
@@ -157,6 +177,7 @@ class DHIS2Extractor:
         logger.info(f"Fetching organisation units from {url}")
         resp = self.session.get(url, params=params, timeout=120)
         resp.raise_for_status()
+        data = self._safe_json(resp, "organisationUnits")
         return {
             ou["id"]: {
                 "name": ou.get("displayName") or ou.get("name"),
@@ -164,7 +185,7 @@ class DHIS2Extractor:
                 "path": ou.get("path"),
                 "level": ou.get("level"),
             }
-            for ou in resp.json().get("organisationUnits", [])
+            for ou in data.get("organisationUnits", [])
         }
 
     # ------------------------------------------------------------------ #
@@ -180,7 +201,7 @@ class DHIS2Extractor:
         logger.info(f"Fetching full datasets from {url}")
         resp = self.session.get(url, params=params, timeout=120)
         resp.raise_for_status()
-        return resp.json().get("dataSets", [])
+        return self._safe_json(resp, "dataSets_full").get("dataSets", [])
 
     def get_data_elements_full(self):
         """Fetch data elements with descriptions."""
@@ -192,7 +213,7 @@ class DHIS2Extractor:
         logger.info(f"Fetching full data elements from {url}")
         resp = self.session.get(url, params=params, timeout=120)
         resp.raise_for_status()
-        return resp.json().get("dataElements", [])
+        return self._safe_json(resp, "dataElements_full").get("dataElements", [])
 
     def get_org_units_full(self):
         """Fetch org units with hierarchy, level, and parent."""
@@ -204,7 +225,7 @@ class DHIS2Extractor:
         logger.info(f"Fetching full organisation units from {url}")
         resp = self.session.get(url, params=params, timeout=120)
         resp.raise_for_status()
-        return resp.json().get("organisationUnits", [])
+        return self._safe_json(resp, "organisationUnits_full").get("organisationUnits", [])
 
     def get_category_option_combos(self):
         """Fetch category option combos with resolved names."""
@@ -216,7 +237,41 @@ class DHIS2Extractor:
         logger.info(f"Fetching category option combos from {url}")
         resp = self.session.get(url, params=params, timeout=120)
         resp.raise_for_status()
-        return resp.json().get("categoryOptionCombos", [])
+        return self._safe_json(resp, "categoryOptionCombos").get("categoryOptionCombos", [])
+
+    def get_category_combos(self):
+        """Fetch category combos (the disaggregation definitions)."""
+        url = f"{self.api_url}/categoryCombos"
+        params = {
+            "paging": "false",
+            "fields": "id,name,displayName,categories[id,name]",
+        }
+        logger.info(f"Fetching category combos from {url}")
+        resp = self.session.get(url, params=params, timeout=120)
+        resp.raise_for_status()
+        return self._safe_json(resp, "categoryCombos").get("categoryCombos", [])
+
+    def get_data_element_category_combos(self):
+        """
+        Return {data_element_id: [category_combo_id, ...]} from DHIS2.
+        Used to populate data_element_to_disaggregation bridge.
+        """
+        url = f"{self.api_url}/dataElements"
+        params = {
+            "paging": "false",
+            "fields": "id,categoryCombo[id]",
+        }
+        logger.info(f"Fetching data element → category combo map")
+        resp = self.session.get(url, params=params, timeout=120)
+        resp.raise_for_status()
+        data = self._safe_json(resp, "de_to_cc")
+        mapping = {}
+        for de in data.get("dataElements", []):
+            de_id = de.get("id")
+            cc_id = (de.get("categoryCombo") or {}).get("id")
+            if de_id and cc_id:
+                mapping.setdefault(de_id, []).append(cc_id)
+        return mapping
 
     # ------------------------------------------------------------------ #
     # Diagnostics
@@ -235,31 +290,4 @@ class DHIS2Extractor:
         """Fetch DHIS2 system info (useful to confirm version)."""
         resp = self.session.get(f"{self.api_url}/system/info", timeout=30)
         resp.raise_for_status()
-        return resp.json()
-
-    def get_data_element_category_combos(self):
-        """Return {data_element_id: [category_combo_id, ...]} from DHIS2."""
-        url = f"{self.api_url}/dataElements"
-        params = {"paging": "false", "fields": "id,categoryCombo[id]"}
-        logger.info(f"Fetching data element → category combo map")
-        resp = self.session.get(url, params=params, timeout=120)
-        resp.raise_for_status()
-        mapping = {}
-        for de in resp.json().get("dataElements", []):
-            de_id = de.get("id")
-            cc = (de.get("categoryCombo") or {}).get("id")
-            if de_id and cc:
-               mapping.setdefault(de_id, []).append(cc)
-        return mapping
-
-    def get_category_combos(self):
-        """Fetch all category combos (the disaggregation definitions)."""
-        url = f"{self.api_url}/categoryCombos"
-        params = {
-            "paging": "false",
-            "fields": "id,name,displayName,categories[id,name]",
-        }
-        logger.info(f"Fetching category combos from {url}")
-        resp = self.session.get(url, params=params, timeout=120)
-        resp.raise_for_status()
-        return resp.json().get("categoryCombos", [])
+        return self._safe_json(resp, "system_info")
